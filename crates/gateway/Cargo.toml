@@ -1,0 +1,26 @@
+[package]
+name = "volsgames-gateway"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+anyhow = { workspace = true }
+base64 = { workspace = true }
+bytes = { workspace = true }
+ed25519-dalek = { workspace = true }
+futures-util = { workspace = true }
+quinn = { workspace = true }
+rcgen = { workspace = true }
+rustls = { workspace = true }
+rustls-pemfile = { workspace = true }
+sha2 = { workspace = true }
+time = { version = "0.3", default-features = false, features = ["std"] }
+tokio = { workspace = true }
+tokio-tungstenite = { workspace = true }
+tracing = { workspace = true }
+volsgames-proto = { workspace = true }
+volsgames-room = { workspace = true }
+web-transport-quinn = { workspace = true }

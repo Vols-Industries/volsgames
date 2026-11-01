@@ -1,3 +1,4 @@
 target/
+.volsgames/
 .DS_Store
 *.log
