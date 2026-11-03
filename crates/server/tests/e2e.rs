@@ -7,6 +7,8 @@ use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, Server
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use serde_json::{Value, json};
 use volsgames::{Config, Running, start};
+use volsgames_control::fleet::{Fleet, Node};
+use volsgames_control::hash_key;
 use volsgames_gateway::Limits;
 use volsgames_proto::{ALPN_QUIC, ClientMessage, Datagram, ServerMessage, StreamBuffer, Target, client_record, code, reason};
 use web_transport_quinn::Session;
@@ -80,19 +82,23 @@ async fn stack() -> Stack {
     Stack { run, _dir: dir, ep }
 }
 
+fn api(http: SocketAddr, method: &str, path: &str, body: Option<Value>, key: &str) -> (u16, Value) {
+    let url = format!("http://{http}{path}");
+    let auth = format!("Bearer {key}");
+    let agent = ureq::Agent::new_with_config(ureq::config::Config::builder().http_status_as_error(false).build());
+    let resp = match (method, body) {
+        ("POST", Some(b)) => agent.post(&url).header("authorization", &auth).send_json(b).unwrap(),
+        ("DELETE", _) => agent.delete(&url).header("authorization", &auth).call().unwrap(),
+        _ => agent.get(&url).header("authorization", &auth).call().unwrap(),
+    };
+    let status = resp.status().as_u16();
+    let text = resp.into_body().read_to_string().unwrap_or_default();
+    (status, serde_json::from_str(&text).unwrap_or(Value::Null))
+}
+
 impl Stack {
     fn api(&self, method: &str, path: &str, body: Option<Value>, key: &str) -> (u16, Value) {
-        let url = format!("http://{}{}", self.run.http, path);
-        let auth = format!("Bearer {key}");
-        let agent = ureq::Agent::new_with_config(ureq::config::Config::builder().http_status_as_error(false).build());
-        let resp = match (method, body) {
-            ("POST", Some(b)) => agent.post(&url).header("authorization", &auth).send_json(b).unwrap(),
-            ("DELETE", _) => agent.delete(&url).header("authorization", &auth).call().unwrap(),
-            _ => agent.get(&url).header("authorization", &auth).call().unwrap(),
-        };
-        let status = resp.status().as_u16();
-        let text = resp.into_body().read_to_string().unwrap_or_default();
-        (status, serde_json::from_str(&text).unwrap_or(Value::Null))
+        api(self.run.http, method, path, body, key)
     }
 
     fn room(&self, room: &str, extra: Value) -> Value {
@@ -310,4 +316,53 @@ async fn websocket_fallback() {
             }
         }
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fleet_routes_rooms_across_nodes() {
+    let a = stack().await;
+    let b = stack().await;
+    let nodes = || {
+        vec![
+            Node { url: format!("http://{}/", a.run.http), key: a.run.api_key.clone() },
+            Node { url: format!("http://{}", b.run.http), key: b.run.api_key.clone() },
+        ]
+    };
+    let (fl, task) = volsgames_control::fleet::serve(Arc::new(Fleet::new(nodes(), hash_key("fleet-key"))), "127.0.0.1:0".parse().unwrap()).await.unwrap();
+    let f = |m, p: &str, body| api(fl, m, p, body, "fleet-key");
+    assert_eq!(api(fl, "GET", "/v1/rooms", None, "wrong").0, 401);
+    for r in ["r1", "r2", "r3", "r4"] {
+        let (s, v) = f("POST", "/v1/rooms", Some(json!({ "game": "g", "room": r })));
+        assert_eq!(s, 201, "{v}");
+        assert!(v["node"].as_str().unwrap().starts_with("http://"));
+    }
+    assert_eq!(a.api("GET", "/v1/rooms", None, &a.run.api_key).1.as_array().unwrap().len(), 2);
+    assert_eq!(b.api("GET", "/v1/rooms", None, &b.run.api_key).1.as_array().unwrap().len(), 2);
+    assert_eq!(f("GET", "/v1/rooms", None).1.as_array().unwrap().len(), 4);
+    let (s, v) = f("GET", "/v1/rooms/r2", None);
+    assert_eq!(s, 200);
+    assert_eq!(v["node"], format!("http://{}", b.run.http));
+    let (s, tok) = f("POST", "/v1/rooms/r2/tokens", Some(json!({ "player": "p" })));
+    assert_eq!(s, 201, "{tok}");
+    assert_eq!(tok["endpoints"]["quic"], b.run.quic.to_string());
+    let mut c = b.connect(tok["token"].as_str().unwrap()).await;
+    assert!(matches!(c.expect().await, ServerMessage::Welcome { player: 1, .. }));
+    let nodes_view = f("GET", "/v1/nodes", None).1;
+    assert_eq!(nodes_view[1]["players"], 1);
+    assert_eq!(nodes_view[0]["rooms"], 2);
+    let (fl2, task2) = volsgames_control::fleet::serve(Arc::new(Fleet::new(nodes(), hash_key("k2"))), "127.0.0.1:0".parse().unwrap()).await.unwrap();
+    assert_eq!(api(fl2, "GET", "/v1/rooms/r3", None, "k2").1["node"], format!("http://{}", a.run.http));
+    assert_eq!(api(fl2, "GET", "/v1/rooms/nope", None, "k2").0, 404);
+    assert_eq!(f("DELETE", "/v1/rooms/r1", None).0, 204);
+    assert_eq!(f("DELETE", "/v1/rooms/r1", None).0, 404);
+    b.run.stop();
+    assert_eq!(f("GET", "/v1/rooms/r4", None).0, 503);
+    let (s, v) = f("POST", "/v1/rooms", Some(json!({ "game": "g", "room": "r5" })));
+    assert_eq!(s, 201, "{v}");
+    assert_eq!(v["node"], format!("http://{}", a.run.http));
+    let nodes_view = f("GET", "/v1/nodes", None).1;
+    assert_eq!(nodes_view[1]["up"], false);
+    assert_eq!(f("GET", "/v1/rooms", None).1.as_array().unwrap().len(), 2);
+    task.abort();
+    task2.abort();
 }

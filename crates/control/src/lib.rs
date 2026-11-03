@@ -15,6 +15,8 @@ use sha2::{Digest, Sha256};
 use volsgames_proto::Claims;
 use volsgames_room::{Host, RoomConfig, now_ms};
 
+pub mod fleet;
+
 #[derive(Clone, Serialize)]
 pub struct Endpoints {
     pub quic: String,
@@ -91,13 +93,13 @@ struct Problem {
     detail: String,
 }
 
-fn problem(status: StatusCode, error: &'static str, detail: impl Into<String>) -> Response {
+pub(crate) fn problem(status: StatusCode, error: &'static str, detail: impl Into<String>) -> Response {
     (status, Json(Problem { error, detail: detail.into() })).into_response()
 }
 
-async fn auth(State(ctl): State<Arc<Control>>, req: Request, next: Next) -> Response {
+pub(crate) async fn auth(State(hash): State<[u8; 32]>, req: Request, next: Next) -> Response {
     let given = req.headers().get(header::AUTHORIZATION).and_then(|v| v.to_str().ok()).and_then(|v| v.strip_prefix("Bearer ")).unwrap_or("");
-    if given.is_empty() || hash_key(given) != ctl.api_key_hash {
+    if given.is_empty() || hash_key(given) != hash {
         return problem(StatusCode::UNAUTHORIZED, "unauthorized", "missing or wrong API key");
     }
     next.run(req).await
@@ -202,7 +204,7 @@ pub fn router(ctl: Arc<Control>) -> Router {
         .route("/v1/rooms", post(create_room).get(list_rooms))
         .route("/v1/rooms/{room}", get(get_room).delete(delete_room))
         .route("/v1/rooms/{room}/tokens", post(mint_token))
-        .route_layer(middleware::from_fn_with_state(ctl.clone(), auth));
+        .route_layer(middleware::from_fn_with_state(ctl.api_key_hash, auth));
     Router::new().route("/healthz", get(healthz)).route("/metrics", get(metrics)).route("/v1/endpoints", get(endpoints)).merge(private).with_state(ctl)
 }
 

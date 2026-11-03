@@ -81,7 +81,7 @@ fn signing_key(opt: Option<String>, dir: &Path) -> anyhow::Result<SigningKey> {
     Ok(SigningKey::from_bytes(&b))
 }
 
-fn api_key(opt: Option<String>, dir: &Path) -> anyhow::Result<String> {
+pub fn api_key(opt: Option<String>, dir: &Path) -> anyhow::Result<String> {
     if let Some(k) = opt {
         return Ok(k);
     }

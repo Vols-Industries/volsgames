@@ -5,6 +5,7 @@ rooms, relay, reconnect, and a REST control API. Apache-2.0.
 
 ```
 cargo run --release -- serve --ws 127.0.0.1:8081
+cargo run --release -- fleet --node http://127.0.0.1:8080 --node-key $(cat .volsgames/api.key)
 cargo run --release --bin volsgames-loadgen -- --api-key $(cat .volsgames/api.key) --bots 50 --insecure
 ```
 

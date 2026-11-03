@@ -2376,6 +2376,7 @@ name = "volsgames-control"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "dashmap",
  "ed25519-dalek",
  "rand",
  "serde",
@@ -2383,6 +2384,7 @@ dependencies = [
  "sha2",
  "tokio",
  "tracing",
+ "ureq",
  "volsgames-proto",
  "volsgames-room",
 ]
