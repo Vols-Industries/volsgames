@@ -36,7 +36,7 @@ impl Tls {
         let mut transport = quinn::TransportConfig::default();
         transport.max_idle_timeout(Some(idle.try_into()?));
         transport.keep_alive_interval(Some(idle / 3));
-        transport.max_concurrent_uni_streams(0u32.into());
+        transport.max_concurrent_uni_streams(3u32.into());
         transport.max_concurrent_bidi_streams(4u32.into());
         transport.datagram_receive_buffer_size(Some(256 * 1024));
         transport.datagram_send_buffer_size(256 * 1024);

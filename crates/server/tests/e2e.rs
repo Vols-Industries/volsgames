@@ -279,6 +279,26 @@ async fn rate_limit_closes_abusers() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn webtransport_over_http3() {
+    let s = stack().await;
+    s.room("wt", json!({}));
+    let client = web_transport_quinn::ClientBuilder::new().with_server_certificate_hashes(vec![s.run.tls.hash().to_vec()]).unwrap();
+    let url = url::Url::parse(&format!("https://127.0.0.1:{}/", s.run.quic.port())).unwrap();
+    let session = tokio::time::timeout(Duration::from_secs(5), client.connect(url)).await.expect("http/3 handshake in time").unwrap();
+    let (send, recv) = session.open_bi().await.unwrap();
+    let mut web = Client { session, send, recv, buf: StreamBuffer::default(), seq: 0 };
+    web.send(&ClientMessage::Hello { token: s.token("wt", "browser") }).await;
+    assert!(matches!(web.expect().await, ServerMessage::Welcome { player: 1, .. }));
+    let mut native = s.connect(&s.token("wt", "native")).await;
+    assert!(matches!(native.expect().await, ServerMessage::Welcome { player: 2, .. }));
+    assert_eq!(web.expect().await, ServerMessage::Joined { player: 2, name: "native".into() });
+    web.datagram(&ClientMessage::Data { target: Target::Others, payload: Bytes::from_static(b"wt") });
+    assert_eq!(native.expect().await, ServerMessage::Data { from: 1, payload: Bytes::from_static(b"wt") });
+    native.datagram(&ClientMessage::Data { target: Target::Others, payload: Bytes::from_static(b"back") });
+    assert_eq!(web.expect().await, ServerMessage::Data { from: 2, payload: Bytes::from_static(b"back") });
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn websocket_fallback() {
     use futures_util::{SinkExt, StreamExt};
     use tokio_tungstenite::tungstenite::Message;

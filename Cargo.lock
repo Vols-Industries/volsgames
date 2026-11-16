@@ -2364,6 +2364,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "ureq",
+ "url",
  "volsgames-control",
  "volsgames-gateway",
  "volsgames-proto",
