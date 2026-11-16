@@ -10,7 +10,7 @@ use web_transport_quinn::{RecvStream, SendStream, Session};
 #[allow(clippy::large_enum_variant)]
 pub enum Rx {
     Quic { session: Session, stream: RecvStream, buf: StreamBuffer, chunk: Vec<u8> },
-    Ws(SplitStream<WebSocketStream<TcpStream>>),
+    Ws { stream: SplitStream<WebSocketStream<TcpStream>>, buf: StreamBuffer },
 }
 
 #[allow(clippy::large_enum_variant)]
@@ -39,22 +39,20 @@ impl Rx {
                     },
                 }
             },
-            Rx::Ws(s) => loop {
-                match s.next().await {
+            Rx::Ws { stream, buf } => loop {
+                if let Some(r) = buf.pop() {
+                    return Some(Frame::Record(r));
+                }
+                match stream.next().await {
                     Some(Ok(Message::Binary(mut b))) => {
                         if b.is_empty() {
                             return None;
                         }
-                        let lane = b.split_to(1)[0];
-                        return match lane {
-                            0 => {
-                                let mut sb = StreamBuffer::default();
-                                sb.push(&b);
-                                return sb.pop().map(Frame::Record);
-                            }
-                            1 => Some(Frame::Datagram(b)),
-                            _ => None,
-                        };
+                        match b.split_to(1)[0] {
+                            0 => buf.push(&b),
+                            1 => return Some(Frame::Datagram(b)),
+                            _ => return None,
+                        }
                     }
                     Some(Ok(Message::Ping(_) | Message::Pong(_))) => continue,
                     _ => return None,

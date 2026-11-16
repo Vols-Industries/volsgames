@@ -286,9 +286,10 @@ async fn websocket_fallback() {
     s.room("w", json!({}));
     let ws: SocketAddr = s.run.ws.unwrap();
     let (mut sock, _) = tokio_tungstenite::connect_async(format!("ws://{ws}/")).await.unwrap();
-    let mut hello = vec![0u8];
-    hello.extend_from_slice(&client_record(&ClientMessage::Hello { token: s.token("w", "web") }));
-    sock.send(Message::Binary(hello.into())).await.unwrap();
+    let hello = client_record(&ClientMessage::Hello { token: s.token("w", "web") });
+    let (head, tail) = hello.split_at(5);
+    sock.send(Message::Binary([&[0u8][..], head].concat().into())).await.unwrap();
+    sock.send(Message::Binary([&[0u8][..], tail].concat().into())).await.unwrap();
     let mut quic = s.connect(&s.token("w", "native")).await;
     assert!(matches!(quic.expect().await, ServerMessage::Welcome { player: 2, .. }));
     let Some(Ok(Message::Binary(mut b))) = sock.next().await else { panic!("no welcome") };
@@ -301,6 +302,12 @@ async fn websocket_fallback() {
     dg.extend_from_slice(&Datagram::frame(1, &client_record(&ClientMessage::Data { target: Target::Others, payload: Bytes::from_static(b"from web") })));
     sock.send(Message::Binary(dg.into())).await.unwrap();
     assert_eq!(quic.expect().await, ServerMessage::Data { from: 1, payload: Bytes::from_static(b"from web") });
+    let mut two = vec![0u8];
+    two.extend_from_slice(&client_record(&ClientMessage::Data { target: Target::Others, payload: Bytes::from_static(b"one") }));
+    two.extend_from_slice(&client_record(&ClientMessage::Data { target: Target::Others, payload: Bytes::from_static(b"two") }));
+    sock.send(Message::Binary(two.into())).await.unwrap();
+    assert_eq!(quic.expect().await, ServerMessage::Data { from: 1, payload: Bytes::from_static(b"one") });
+    assert_eq!(quic.expect().await, ServerMessage::Data { from: 1, payload: Bytes::from_static(b"two") });
     quic.send(&ClientMessage::Data { target: Target::All, payload: Bytes::from_static(b"to web") }).await;
     loop {
         let Some(Ok(Message::Binary(mut b))) = sock.next().await else { panic!("no data") };

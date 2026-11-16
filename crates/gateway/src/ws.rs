@@ -4,6 +4,8 @@ use std::sync::Arc;
 use futures_util::StreamExt;
 use tokio::net::TcpListener;
 
+use volsgames_proto::StreamBuffer;
+
 use crate::Gateway;
 use crate::link::{Rx, Tx};
 use crate::session::serve;
@@ -22,7 +24,7 @@ pub async fn run(gw: Arc<Gateway>, addr: SocketAddr) -> anyhow::Result<SocketAdd
                     _ => return,
                 };
                 let (sink, stream) = ws.split();
-                serve(gw, Rx::Ws(stream), Tx::Ws(sink), remote, "websocket").await;
+                serve(gw, Rx::Ws { stream, buf: StreamBuffer::default() }, Tx::Ws(sink), remote, "websocket").await;
             });
         }
     });
