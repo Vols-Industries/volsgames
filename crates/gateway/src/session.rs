@@ -47,11 +47,11 @@ async fn run(gw: &Arc<Gateway>, conn: u64, rx: &mut Rx, tx: Tx, remote: SocketAd
         }
     };
     let room: RoomId = Arc::from(claims.room.as_str());
-    let Some((_, cfg, _, _)) = gw.host.get(&room) else {
+    let Some(info) = gw.host.get(&room) else {
         refuse(tx, code::NO_ROOM, "no such room").await;
         return Err((code::NO_ROOM, "no such room"));
     };
-    if cfg.game.as_ref() != claims.game {
+    if info.config.game.as_ref() != claims.game {
         refuse(tx, code::WRONG_GAME, "token is for another game").await;
         return Err((code::WRONG_GAME, "wrong game"));
     }

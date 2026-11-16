@@ -88,6 +88,7 @@ fn api(http: SocketAddr, method: &str, path: &str, body: Option<Value>, key: &st
     let agent = ureq::Agent::new_with_config(ureq::config::Config::builder().http_status_as_error(false).build());
     let resp = match (method, body) {
         ("POST", Some(b)) => agent.post(&url).header("authorization", &auth).send_json(b).unwrap(),
+        ("PATCH", Some(b)) => agent.patch(&url).header("authorization", &auth).send_json(b).unwrap(),
         ("DELETE", _) => agent.delete(&url).header("authorization", &auth).call().unwrap(),
         _ => agent.get(&url).header("authorization", &auth).call().unwrap(),
     };
@@ -267,6 +268,64 @@ async fn reconnect_replaces_old_connection() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn room_state_host_and_backend_controls() {
+    let s = stack().await;
+    let k = s.run.api_key.clone();
+    s.room("s", json!({ "max_players": 3 }));
+    let set = |scope, key: &str, value: &'static [u8], expect| ClientMessage::Set { scope, key: key.into(), value: Some(Bytes::from_static(value)), expect };
+    let state =
+        |scope, key: &str, rev, by, value: &'static [u8]| ServerMessage::State { scope, key: key.into(), rev, by, value: Some(Bytes::from_static(value)) };
+    let mut a = s.connect(&s.token("s", "alice")).await;
+    assert!(matches!(a.expect().await, ServerMessage::Welcome { player: 1, host: 1, entries: 0, .. }));
+    a.send(&set(0, "phase", b"lobby", Some(0))).await;
+    assert_eq!(a.expect().await, state(0, "phase", 1, 1, b"lobby"));
+    let (st, v) = s.api("POST", "/v1/rooms/s/state", Some(json!({ "key": "seed", "value": "NDI=" })), &k);
+    assert_eq!((st, v), (200, json!({ "scope": 0, "key": "seed", "rev": 2 })));
+    assert_eq!(a.expect().await, state(0, "seed", 2, 0, b"42"));
+    let mut b = s.connect(&s.token("s", "bob")).await;
+    assert!(matches!(b.expect().await, ServerMessage::Welcome { player: 2, host: 1, entries: 2, .. }));
+    assert_eq!(b.expect().await, state(0, "phase", 1, 1, b"lobby"));
+    assert_eq!(b.expect().await, state(0, "seed", 2, 0, b"42"));
+    assert_eq!(a.expect().await, ServerMessage::Joined { player: 2, name: "bob".into() });
+    b.send(&set(0, "seed", b"7", None)).await;
+    assert_eq!(b.expect().await, ServerMessage::Refused { scope: 0, key: "seed".into(), code: code::FORBIDDEN });
+    b.send(&set(0, "phase", b"play", Some(1))).await;
+    assert_eq!(b.expect().await, state(0, "phase", 3, 2, b"play"));
+    assert_eq!(a.expect().await, state(0, "phase", 3, 2, b"play"));
+    let (st, v) = s.api("GET", "/v1/rooms/s/players", None, &k);
+    assert_eq!(st, 200);
+    assert_eq!(v["host"], 1);
+    assert_eq!(v["players"][1], json!({ "id": 2, "player": "bob", "name": "bob", "connected": true }));
+    let (_, v) = s.api("GET", "/v1/rooms/s/state", None, &k);
+    assert_eq!(v["rev"], 3);
+    assert_eq!(v["entries"][0], json!({ "scope": 0, "key": "phase", "value": "cGxheQ==", "rev": 3, "by": 2 }));
+    assert_eq!(s.api("POST", "/v1/rooms/s/state", Some(json!({ "key": "seed", "value": "!" })), &k).0, 400);
+    assert_eq!(s.api("POST", "/v1/rooms/s/state", Some(json!({ "key": "seed", "value": 5 })), &k).0, 400);
+    assert_eq!(s.api("POST", "/v1/rooms/s/state", Some(json!({ "key": "seed", "value": null, "expect": 1 })), &k).1["error"], "conflict");
+    assert_eq!(s.api("POST", "/v1/rooms/s/state", Some(json!({ "key": "t", "value": "AA==", "player": "nobody" })), &k).1["error"], "no_player");
+    assert_eq!(s.api("POST", "/v1/rooms/nope/state", Some(json!({ "key": "t", "value": "AA==" })), &k).0, 404);
+    let (st, v) = s.api("POST", "/v1/rooms/s/state", Some(json!({ "key": "team", "value": "cmVk", "player": "bob" })), &k);
+    assert_eq!((st, v["scope"].clone()), (200, json!(2)));
+    assert_eq!(a.expect().await, state(2, "team", 4, 0, b"red"));
+    assert_eq!(b.expect().await, state(2, "team", 4, 0, b"red"));
+    let (st, v) = s.api("PATCH", "/v1/rooms/s", Some(json!({ "locked": true })), &k);
+    assert_eq!((st, v["locked"].clone()), (200, json!(true)));
+    let mut c = s.connect(&s.token("s", "carol")).await;
+    assert!(matches!(c.expect().await, ServerMessage::Error { code: code::LOCKED, .. }));
+    assert_eq!(s.api("DELETE", "/v1/rooms/s/players/alice", None, &k).0, 204);
+    assert_eq!(a.expect().await, ServerMessage::Bye { reason: reason::KICKED });
+    assert!(a.closed().await);
+    assert_eq!(b.expect().await, ServerMessage::Left { player: 1, reason: reason::KICKED });
+    assert_eq!(b.expect().await, ServerMessage::Host { player: 2 });
+    assert_eq!(s.api("DELETE", "/v1/rooms/s/players/alice", None, &k).1["error"], "no_player");
+    assert_eq!(s.api("PATCH", "/v1/rooms/s", Some(json!({ "locked": false })), &k).1["locked"], false);
+    let mut again = s.connect(&s.token("s", "alice")).await;
+    assert!(matches!(again.expect().await, ServerMessage::Error { code: code::FORBIDDEN, .. }));
+    assert_eq!(s.api("GET", "/v1/rooms/nope/players", None, &k).0, 404);
+    assert_eq!(s.api("GET", "/v1/rooms/s", None, &k).1["max_state_bytes"], 65_536);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn rate_limit_closes_abusers() {
     let s = stack().await;
     s.room("r", json!({}));
@@ -377,6 +436,15 @@ async fn fleet_routes_rooms_across_nodes() {
     let nodes_view = f("GET", "/v1/nodes", None).1;
     assert_eq!(nodes_view[1]["players"], 1);
     assert_eq!(nodes_view[0]["rooms"], 2);
+    let (s, v) = f("GET", "/v1/rooms/r2/players", None);
+    assert_eq!((s, v["host"].clone(), v["node"].clone()), (200, json!(1), json!(format!("http://{}", b.run.http))));
+    assert_eq!(f("POST", "/v1/rooms/r2/state", Some(json!({ "key": "k", "value": "AQ==" }))).1["rev"], 1);
+    assert_eq!(c.expect().await, ServerMessage::State { scope: 0, key: "k".into(), rev: 1, by: 0, value: Some(Bytes::from_static(&[1])) });
+    assert_eq!(f("GET", "/v1/rooms/r2/state", None).1["entries"][0]["value"], "AQ==");
+    assert_eq!(f("PATCH", "/v1/rooms/r2", Some(json!({ "locked": true }))).1["locked"], true);
+    assert_eq!(f("DELETE", "/v1/rooms/r2/players/nobody", None).1["error"], "no_player");
+    assert_eq!(f("DELETE", "/v1/rooms/r2/players/p", None).0, 204);
+    assert_eq!(c.expect().await, ServerMessage::Bye { reason: reason::KICKED });
     let (fl2, task2) = volsgames_control::fleet::serve(Arc::new(Fleet::new(nodes(), hash_key("k2"))), "127.0.0.1:0".parse().unwrap()).await.unwrap();
     assert_eq!(api(fl2, "GET", "/v1/rooms/r3", None, "k2").1["node"], format!("http://{}", a.run.http));
     assert_eq!(api(fl2, "GET", "/v1/rooms/nope", None, "k2").0, 404);

@@ -7,6 +7,8 @@ pub const ALPN_H3: &[u8] = b"h3";
 pub const MAX_RECORD: usize = u16::MAX as usize;
 pub const DATAGRAM_BUDGET: usize = 1150;
 pub const MAX_NAME: usize = 32;
+pub const MAX_KEY: usize = 64;
+pub const MAX_VALUE: usize = 8192;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Lane {
@@ -30,17 +32,21 @@ pub enum ClientMessage {
     Subscribe { group: u32 },
     Unsubscribe { group: u32 },
     Leave,
+    Set { scope: u32, key: String, value: Option<Bytes>, expect: Option<u64> },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ServerMessage {
-    Welcome { player: u32, room: String, tick_rate: u16, server_time: u64, reconnected: bool, players: Vec<(u32, String)> },
+    Welcome { player: u32, room: String, tick_rate: u16, server_time: u64, reconnected: bool, players: Vec<(u32, String)>, host: u32, entries: u32 },
     Joined { player: u32, name: String },
     Left { player: u32, reason: u8 },
     Data { from: u32, payload: Bytes },
     Pong { client_time: u64, server_time: u64 },
     Error { code: u16, message: String },
     Bye { reason: u8 },
+    State { scope: u32, key: String, rev: u64, by: u32, value: Option<Bytes> },
+    Refused { scope: u32, key: String, code: u16 },
+    Host { player: u32 },
 }
 
 pub mod reason {
@@ -61,6 +67,10 @@ pub mod code {
     pub const PROTOCOL: u16 = 5;
     pub const HELLO_TIMEOUT: u16 = 6;
     pub const WRONG_GAME: u16 = 7;
+    pub const CONFLICT: u16 = 8;
+    pub const FORBIDDEN: u16 = 9;
+    pub const TOO_LARGE: u16 = 10;
+    pub const LOCKED: u16 = 11;
 }
 
 const C_HELLO: u8 = 1;
@@ -69,6 +79,7 @@ const C_PING: u8 = 3;
 const C_SUBSCRIBE: u8 = 4;
 const C_UNSUBSCRIBE: u8 = 5;
 const C_LEAVE: u8 = 6;
+const C_SET: u8 = 7;
 const S_WELCOME: u8 = 0x81;
 const S_JOINED: u8 = 0x82;
 const S_LEFT: u8 = 0x83;
@@ -76,6 +87,9 @@ const S_DATA: u8 = 0x84;
 const S_PONG: u8 = 0x85;
 const S_ERROR: u8 = 0x86;
 const S_BYE: u8 = 0x87;
+const S_STATE: u8 = 0x88;
+const S_REFUSED: u8 = 0x89;
+const S_HOST: u8 = 0x8A;
 
 impl Target {
     fn write(self, w: &mut Writer) {
@@ -130,6 +144,18 @@ impl ClientMessage {
                 w.u32(*group);
             }
             ClientMessage::Leave => w.u8(C_LEAVE),
+            ClientMessage::Set { scope, key, value, expect } => {
+                w.u8(C_SET);
+                w.u32(*scope);
+                w.str(key);
+                w.u8(u8::from(value.is_some()) | (u8::from(expect.is_some()) << 1));
+                if let Some(e) = expect {
+                    w.u64(*e);
+                }
+                if let Some(v) = value {
+                    w.bytes(v);
+                }
+            }
         }
     }
 
@@ -147,6 +173,17 @@ impl ClientMessage {
             C_SUBSCRIBE => ClientMessage::Subscribe { group: r.u32()? },
             C_UNSUBSCRIBE => ClientMessage::Unsubscribe { group: r.u32()? },
             C_LEAVE => ClientMessage::Leave,
+            C_SET => {
+                let scope = r.u32()?;
+                let key = r.str()?;
+                let flags = r.u8()?;
+                if flags > 3 {
+                    return Err(DecodeError::Malformed);
+                }
+                let expect = if flags & 2 != 0 { Some(r.u64()?) } else { None };
+                let value = if flags & 1 != 0 { Some(r.bytes()?) } else { None };
+                ClientMessage::Set { scope, key, value, expect }
+            }
             k => return Err(DecodeError::UnknownKind(k)),
         };
         r.finish()?;
@@ -158,7 +195,7 @@ impl ServerMessage {
     pub fn write(&self, out: &mut BytesMut) {
         let mut w = Writer(out);
         match self {
-            ServerMessage::Welcome { player, room, tick_rate, server_time, reconnected, players } => {
+            ServerMessage::Welcome { player, room, tick_rate, server_time, reconnected, players, host, entries } => {
                 w.u8(S_WELCOME);
                 w.u8(VERSION);
                 w.u32(*player);
@@ -171,6 +208,8 @@ impl ServerMessage {
                     w.u32(*id);
                     w.str(name);
                 }
+                w.u32(*host);
+                w.varint(u64::from(*entries));
             }
             ServerMessage::Joined { player, name } => {
                 w.u8(S_JOINED);
@@ -201,6 +240,27 @@ impl ServerMessage {
                 w.u8(S_BYE);
                 w.u8(*reason);
             }
+            ServerMessage::State { scope, key, rev, by, value } => {
+                w.u8(S_STATE);
+                w.u32(*scope);
+                w.str(key);
+                w.u64(*rev);
+                w.u32(*by);
+                w.u8(u8::from(value.is_some()));
+                if let Some(v) = value {
+                    w.bytes(v);
+                }
+            }
+            ServerMessage::Refused { scope, key, code } => {
+                w.u8(S_REFUSED);
+                w.u32(*scope);
+                w.str(key);
+                w.u16(*code);
+            }
+            ServerMessage::Host { player } => {
+                w.u8(S_HOST);
+                w.u32(*player);
+            }
         }
     }
 
@@ -224,7 +284,9 @@ impl ServerMessage {
                 for _ in 0..n {
                     players.push((r.u32()?, r.str()?));
                 }
-                ServerMessage::Welcome { player, room, tick_rate, server_time, reconnected, players }
+                let host = r.u32()?;
+                let entries = u32::try_from(r.varint()?).map_err(|_| DecodeError::TooLong)?;
+                ServerMessage::Welcome { player, room, tick_rate, server_time, reconnected, players, host, entries }
             }
             S_JOINED => ServerMessage::Joined { player: r.u32()?, name: r.str()? },
             S_LEFT => ServerMessage::Left { player: r.u32()?, reason: r.u8()? },
@@ -232,6 +294,20 @@ impl ServerMessage {
             S_PONG => ServerMessage::Pong { client_time: r.u64()?, server_time: r.u64()? },
             S_ERROR => ServerMessage::Error { code: r.u16()?, message: r.str()? },
             S_BYE => ServerMessage::Bye { reason: r.u8()? },
+            S_STATE => {
+                let scope = r.u32()?;
+                let key = r.str()?;
+                let rev = r.u64()?;
+                let by = r.u32()?;
+                let value = match r.u8()? {
+                    0 => None,
+                    1 => Some(r.bytes()?),
+                    _ => return Err(DecodeError::Malformed),
+                };
+                ServerMessage::State { scope, key, rev, by, value }
+            }
+            S_REFUSED => ServerMessage::Refused { scope: r.u32()?, key: r.str()?, code: r.u16()? },
+            S_HOST => ServerMessage::Host { player: r.u32()? },
             k => return Err(DecodeError::UnknownKind(k)),
         };
         r.finish()?;
@@ -371,17 +447,47 @@ mod tests {
         round_c(ClientMessage::Subscribe { group: 3 });
         round_c(ClientMessage::Unsubscribe { group: 3 });
         round_c(ClientMessage::Leave);
+        round_c(ClientMessage::Set { scope: 0, key: "phase".into(), value: Some(Bytes::from_static(b"lobby")), expect: None });
+        round_c(ClientMessage::Set { scope: 4, key: "k".into(), value: None, expect: Some(0) });
+        round_c(ClientMessage::Set { scope: 0, key: "k".into(), value: Some(Bytes::new()), expect: Some(u64::MAX) });
     }
 
     #[test]
     fn server_messages() {
-        round_s(ServerMessage::Welcome { player: 1, room: "r".into(), tick_rate: 60, server_time: 5, reconnected: true, players: vec![(2, "bob".into())] });
+        round_s(ServerMessage::Welcome {
+            player: 1,
+            room: "r".into(),
+            tick_rate: 60,
+            server_time: 5,
+            reconnected: true,
+            players: vec![(2, "bob".into())],
+            host: 2,
+            entries: 300,
+        });
         round_s(ServerMessage::Joined { player: 2, name: "x".into() });
         round_s(ServerMessage::Left { player: 2, reason: reason::TIMEOUT });
         round_s(ServerMessage::Data { from: 2, payload: Bytes::from_static(b"q") });
         round_s(ServerMessage::Pong { client_time: 1, server_time: 2 });
         round_s(ServerMessage::Error { code: code::FULL, message: "full".into() });
         round_s(ServerMessage::Bye { reason: reason::KICKED });
+        round_s(ServerMessage::State { scope: 0, key: "score".into(), rev: 9, by: 2, value: Some(Bytes::from_static(b"10")) });
+        round_s(ServerMessage::State { scope: 3, key: "ready".into(), rev: 10, by: 0, value: None });
+        round_s(ServerMessage::Refused { scope: 0, key: "flag".into(), code: code::CONFLICT });
+        round_s(ServerMessage::Host { player: 0 });
+    }
+
+    #[test]
+    fn bad_flags_rejected() {
+        let mut out = BytesMut::new();
+        ClientMessage::Set { scope: 0, key: "k".into(), value: None, expect: None }.write(&mut out);
+        let at = out.len() - 1;
+        out[at] = 4;
+        assert_eq!(ClientMessage::read(out.freeze()), Err(DecodeError::Malformed));
+        let mut out = BytesMut::new();
+        ServerMessage::State { scope: 0, key: "k".into(), rev: 1, by: 1, value: None }.write(&mut out);
+        let at = out.len() - 1;
+        out[at] = 2;
+        assert_eq!(ServerMessage::read(out.freeze()), Err(DecodeError::Malformed));
     }
 
     #[test]

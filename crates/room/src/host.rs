@@ -1,20 +1,41 @@
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering::Relaxed};
+use std::sync::atomic::Ordering::Relaxed;
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
 use std::time::Instant;
 
 use dashmap::DashMap;
 
 use crate::room::Room;
-use crate::{Command, JoinRequest, Metrics, RoomConfig, RoomId, now_ms};
+use crate::{Admin, Command, JoinRequest, Live, Metrics, RoomConfig, RoomId, now_ms};
 
 pub struct RoomEntry {
     pub worker: usize,
     pub config: RoomConfig,
     pub created_ms: u64,
-    pub players: Arc<AtomicU32>,
+    pub live: Arc<Live>,
+}
+
+#[derive(Clone, Debug)]
+pub struct RoomInfo {
+    pub worker: usize,
+    pub config: RoomConfig,
+    pub created_ms: u64,
+    pub players: u32,
+    pub locked: bool,
+}
+
+impl RoomEntry {
+    fn info(&self) -> RoomInfo {
+        RoomInfo {
+            worker: self.worker,
+            config: self.config.clone(),
+            created_ms: self.created_ms,
+            players: self.live.players.load(Relaxed),
+            locked: self.live.locked.load(Relaxed),
+        }
+    }
 }
 
 pub struct Host {
@@ -49,23 +70,35 @@ impl Host {
         let mut h = std::collections::hash_map::DefaultHasher::new();
         room.hash(&mut h);
         let worker = (h.finish() % self.workers.len() as u64) as usize;
-        let entry = RoomEntry { worker, config: config.clone(), created_ms: now_ms(), players: Arc::new(AtomicU32::new(0)) };
+        let live = Arc::new(Live::default());
+        let entry = RoomEntry { worker, config: config.clone(), created_ms: now_ms(), live: live.clone() };
         if self.rooms.contains_key(&room) {
             return false;
         }
         self.rooms.insert(room.clone(), entry);
         Metrics::inc(&self.metrics.rooms);
         Metrics::inc(&self.metrics.rooms_total);
-        let _ = self.workers[worker].send(Command::Create { room, config });
+        let _ = self.workers[worker].send(Command::Create { room, config, live });
         true
     }
 
-    pub fn get(&self, room: &str) -> Option<(usize, RoomConfig, u64, u32)> {
-        self.rooms.get(room).map(|e| (e.worker, e.config.clone(), e.created_ms, e.players.load(Relaxed)))
+    pub fn get(&self, room: &str) -> Option<RoomInfo> {
+        self.rooms.get(room).map(|e| e.info())
     }
 
-    pub fn list(&self) -> Vec<(RoomId, RoomConfig, u64, u32)> {
-        self.rooms.iter().map(|e| (e.key().clone(), e.config.clone(), e.created_ms, e.players.load(Relaxed))).collect()
+    pub fn list(&self) -> Vec<(RoomId, RoomInfo)> {
+        self.rooms.iter().map(|e| (e.key().clone(), e.info())).collect()
+    }
+
+    pub fn lock(&self, room: &str, locked: bool) -> Option<RoomInfo> {
+        let e = self.rooms.get(room)?;
+        e.live.locked.store(locked, Relaxed);
+        Some(e.info())
+    }
+
+    pub fn admin(&self, room: &str, op: Admin) -> bool {
+        let Some(worker) = self.rooms.get(room).map(|e| e.worker) else { return false };
+        self.workers[worker].send(Command::Admin { room: Arc::from(room), op }).is_ok()
     }
 
     pub fn join(&self, req: JoinRequest) -> Option<usize> {
@@ -100,13 +133,13 @@ fn run(index: usize, rx: Receiver<Command>, rooms: Arc<DashMap<RoomId, RoomEntry
             None => rx.recv().map_err(|_| RecvTimeoutError::Disconnected),
         };
         match first {
-            Ok(cmd) => handle(cmd, &mut local, &rooms, &metrics),
+            Ok(cmd) => handle(cmd, &mut local, &metrics),
             Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => break,
         }
         for _ in 0..1024 {
             match rx.try_recv() {
-                Ok(cmd) => handle(cmd, &mut local, &rooms, &metrics),
+                Ok(cmd) => handle(cmd, &mut local, &metrics),
                 Err(_) => break,
             }
         }
@@ -132,11 +165,10 @@ fn run(index: usize, rx: Receiver<Command>, rooms: Arc<DashMap<RoomId, RoomEntry
     }
 }
 
-fn handle(cmd: Command, local: &mut HashMap<RoomId, Room>, rooms: &DashMap<RoomId, RoomEntry>, metrics: &Arc<Metrics>) {
+fn handle(cmd: Command, local: &mut HashMap<RoomId, Room>, metrics: &Arc<Metrics>) {
     match cmd {
-        Command::Create { room, config } => {
-            let counter = rooms.get(&room).map(|e| e.players.clone()).unwrap_or_default();
-            local.entry(room.clone()).or_insert_with(|| Room::new(room, config, counter, metrics.clone()));
+        Command::Create { room, config, live } => {
+            local.entry(room.clone()).or_insert_with(|| Room::new(room, config, live, metrics.clone()));
         }
         Command::Join(req) => match local.get_mut(&req.room) {
             Some(r) => r.join(req),
@@ -157,6 +189,11 @@ fn handle(cmd: Command, local: &mut HashMap<RoomId, Room>, rooms: &DashMap<RoomI
         Command::Close { room } => {
             if let Some(r) = local.get_mut(&room) {
                 r.close();
+            }
+        }
+        Command::Admin { room, op } => {
+            if let Some(r) = local.get_mut(&room) {
+                r.admin(op);
             }
         }
     }

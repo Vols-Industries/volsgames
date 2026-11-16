@@ -6,7 +6,7 @@ use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::middleware;
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use dashmap::DashMap;
 use serde::Serialize;
@@ -56,6 +56,7 @@ impl Fleet {
             let auth = format!("Bearer {key}");
             let resp = match (method, body) {
                 ("POST", Some(b)) => agent.post(&url).header("authorization", &auth).send_json(b),
+                ("PATCH", Some(b)) => agent.patch(&url).header("authorization", &auth).send_json(b),
                 ("DELETE", _) => agent.delete(&url).header("authorization", &auth).call(),
                 _ => agent.get(&url).header("authorization", &auth).call(),
             }
@@ -109,10 +110,11 @@ impl Fleet {
         let Some(i) = self.locate(room).await else {
             return problem(StatusCode::NOT_FOUND, "no_room", "no such room");
         };
+        let whole = method == "DELETE" && path == format!("/v1/rooms/{room}");
         let Some(r) = self.call(i, method, path, body).await else {
             return problem(StatusCode::SERVICE_UNAVAILABLE, "node_down", "the node holding this room is unreachable");
         };
-        if r.status == 404 || r.status == 204 {
+        if r.body["error"] == "no_room" || (whole && r.status == 204) {
             self.placed.remove(room);
         }
         relay(r.status, self.tag(i, r.body))
@@ -159,8 +161,28 @@ async fn get_room(State(f): State<Arc<Fleet>>, Path(room): Path<String>) -> Resp
     f.forward(&room, "GET", format!("/v1/rooms/{room}"), None).await
 }
 
+async fn patch_room(State(f): State<Arc<Fleet>>, Path(room): Path<String>, Json(req): Json<Value>) -> Response {
+    f.forward(&room, "PATCH", format!("/v1/rooms/{room}"), Some(req)).await
+}
+
 async fn delete_room(State(f): State<Arc<Fleet>>, Path(room): Path<String>) -> Response {
     f.forward(&room, "DELETE", format!("/v1/rooms/{room}"), None).await
+}
+
+async fn players(State(f): State<Arc<Fleet>>, Path(room): Path<String>) -> Response {
+    f.forward(&room, "GET", format!("/v1/rooms/{room}/players"), None).await
+}
+
+async fn kick(State(f): State<Arc<Fleet>>, Path((room, player)): Path<(String, String)>) -> Response {
+    f.forward(&room, "DELETE", format!("/v1/rooms/{room}/players/{player}"), None).await
+}
+
+async fn get_state(State(f): State<Arc<Fleet>>, Path(room): Path<String>) -> Response {
+    f.forward(&room, "GET", format!("/v1/rooms/{room}/state"), None).await
+}
+
+async fn set_state(State(f): State<Arc<Fleet>>, Path(room): Path<String>, Json(req): Json<Value>) -> Response {
+    f.forward(&room, "POST", format!("/v1/rooms/{room}/state"), Some(req)).await
 }
 
 async fn mint_token(State(f): State<Arc<Fleet>>, Path(room): Path<String>, Json(req): Json<Value>) -> Response {
@@ -178,8 +200,11 @@ async fn healthz() -> &'static str {
 pub fn router(f: Arc<Fleet>) -> Router {
     let private = Router::new()
         .route("/v1/rooms", post(create_room).get(list_rooms))
-        .route("/v1/rooms/{room}", get(get_room).delete(delete_room))
+        .route("/v1/rooms/{room}", get(get_room).patch(patch_room).delete(delete_room))
         .route("/v1/rooms/{room}/tokens", post(mint_token))
+        .route("/v1/rooms/{room}/players", get(players))
+        .route("/v1/rooms/{room}/players/{player}", delete(kick))
+        .route("/v1/rooms/{room}/state", get(get_state).post(set_state))
         .route("/v1/nodes", get(nodes))
         .route_layer(middleware::from_fn_with_state(f.api_key_hash, auth));
     Router::new().route("/healthz", get(healthz)).merge(private).with_state(f)
