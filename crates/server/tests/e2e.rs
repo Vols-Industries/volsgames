@@ -310,14 +310,14 @@ async fn websocket_fallback() {
     let (head, tail) = hello.split_at(5);
     sock.send(Message::Binary([&[0u8][..], head].concat().into())).await.unwrap();
     sock.send(Message::Binary([&[0u8][..], tail].concat().into())).await.unwrap();
-    let mut quic = s.connect(&s.token("w", "native")).await;
-    assert!(matches!(quic.expect().await, ServerMessage::Welcome { player: 2, .. }));
     let Some(Ok(Message::Binary(mut b))) = sock.next().await else { panic!("no welcome") };
     assert_eq!(b[0], 0);
     let _ = b.split_to(1);
     let mut sb = StreamBuffer::default();
     sb.push(&b);
     assert!(matches!(ServerMessage::read(sb.pop().unwrap()).unwrap(), ServerMessage::Welcome { player: 1, .. }));
+    let mut quic = s.connect(&s.token("w", "native")).await;
+    assert!(matches!(quic.expect().await, ServerMessage::Welcome { player: 2, .. }));
     let mut dg = vec![1u8];
     dg.extend_from_slice(&Datagram::frame(1, &client_record(&ClientMessage::Data { target: Target::Others, payload: Bytes::from_static(b"from web") })));
     sock.send(Message::Binary(dg.into())).await.unwrap();
